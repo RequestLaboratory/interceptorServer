@@ -32,7 +32,7 @@ const ALLOWED_FORWARD_HEADERS = [
   'cache-control', 'x-requested-with', 'x-api-key', 'x-auth-token'
 ];
 const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Origin': 'https://www.requestlab.cc',
   'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, CONNECT',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization, apikey, Upgrade, Connection, X-Requested-With, Accept, Accept-Language, Cache-Control, X-API-Key, X-Auth-Token, X-CSRF-Token, X-Forwarded-For, X-Forwarded-Proto, X-Real-IP, User-Agent, Origin, Referer',
   'Access-Control-Max-Age': '86400',
@@ -70,13 +70,29 @@ function checkRateLimit(key) {
 // Helpers
 function handleCors(req, res) {
   if (req.method === 'OPTIONS') {
-    res.status(200).set(corsHeaders).end();
+    const origin = req.headers.origin;
+    const corsResponseHeaders = { ...corsHeaders };
+    
+    // Allow requests from www.requestlab.cc
+    if (origin && (origin === 'https://www.requestlab.cc' || origin === 'http://www.requestlab.cc')) {
+      corsResponseHeaders['Access-Control-Allow-Origin'] = origin;
+    }
+    
+    res.status(200).set(corsResponseHeaders).end();
     return true;
   }
   return false;
 }
-function addCorsHeaders(res) {
-  Object.entries(corsHeaders).forEach(([k, v]) => res.set(k, v));
+function addCorsHeaders(res, req) {
+  const origin = req.headers.origin;
+  const responseHeaders = { ...corsHeaders };
+  
+  // Allow requests from www.requestlab.cc
+  if (origin && (origin === 'https://www.requestlab.cc' || origin === 'http://www.requestlab.cc')) {
+    responseHeaders['Access-Control-Allow-Origin'] = origin;
+  }
+  
+  Object.entries(responseHeaders).forEach(([k, v]) => res.set(k, v));
 }
 function sanitizeHeaders(headers) {
   const sanitized = {};
@@ -117,7 +133,7 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use((req, res, next) => {
   if (handleCors(req, res)) return;
-  addCorsHeaders(res);
+  addCorsHeaders(res, req);
   next();
 });
 
@@ -141,15 +157,25 @@ app.get('/status', (req, res) => {
 // SSE endpoint (stub)
 app.get('/events', (req, res) => {
   if (isAPI === 1) return res.status(400).json({ error: 'SSE not available in API mode' });
-  res.writeHead(200, {
+  
+  const origin = req.headers.origin;
+  const sseHeaders = {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache, no-transform',
     'Connection': 'keep-alive',
-    'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
     'X-Accel-Buffering': 'no'
-  });
+  };
+  
+  // Allow requests from www.requestlab.cc
+  if (origin && (origin === 'https://www.requestlab.cc' || origin === 'http://www.requestlab.cc')) {
+    sseHeaders['Access-Control-Allow-Origin'] = origin;
+  } else {
+    sseHeaders['Access-Control-Allow-Origin'] = '*';
+  }
+  
+  res.writeHead(200, sseHeaders);
   res.write('retry: 1000\n');
   res.write('data: {"type":"connected"}\n\n');
   const heartbeat = setInterval(() => res.write('data: {"type":"heartbeat"}\n\n'), 15000);
