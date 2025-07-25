@@ -76,7 +76,7 @@ function handleCors(req, res) {
   return false;
 }
 function addCorsHeaders(res, req) {
-  Object.entries(corsHeaders).forEach(([k, v]) => res.set(k, v));
+  Object.entries(corsHeaders).forEach(([k, v]) => res.header(k, v));
 }
 function sanitizeHeaders(headers) {
   const sanitized = {};
@@ -115,9 +115,21 @@ app.use(helmet());
 app.use(morgan('combined'));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Comprehensive CORS middleware
 app.use((req, res, next) => {
-  addCorsHeaders(res, req);
-  if (req.method === 'OPTIONS') return res.status(200).end();
+  // Always set CORS headers
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, CONNECT');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, apikey, Upgrade, Connection, X-Requested-With, Accept, Accept-Language, Cache-Control, X-API-Key, X-Auth-Token, X-CSRF-Token, X-Forwarded-For, X-Forwarded-Proto, X-Real-IP, User-Agent, Origin, Referer');
+  res.header('Access-Control-Max-Age', '86400');
+  res.header('Access-Control-Allow-Credentials', 'false');
+  
+  // Handle preflight requests
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+  
   next();
 });
 
@@ -141,13 +153,16 @@ app.get('/status', (req, res) => {
 // SSE endpoint (stub)
 app.get('/events', (req, res) => {
   if (isAPI === 1) return res.status(400).json({ error: 'SSE not available in API mode' });
+  
+  // Set CORS headers for SSE
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache, no-transform',
     'Connection': 'keep-alive',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type',
     'X-Accel-Buffering': 'no'
   });
   res.write('retry: 1000\n');
