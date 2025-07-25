@@ -116,8 +116,8 @@ app.use(morgan('combined'));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use((req, res, next) => {
-  if (handleCors(req, res)) return;
   addCorsHeaders(res, req);
+  if (req.method === 'OPTIONS') return res.status(200).end();
   next();
 });
 
