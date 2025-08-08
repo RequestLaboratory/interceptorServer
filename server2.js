@@ -44,8 +44,8 @@ const corsOptions = {
     'http://localhost:5174', 
     'http://localhost:3000',
     'http://localhost:4173',
-    'https://jsoncompare.vercel.app',
-    'https://jsoncompare-git-main-yadev64.vercel.app'
+    'https://www.requestlab.cc',
+    'https://requestlab.cc'
   ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH', 'HEAD'],
