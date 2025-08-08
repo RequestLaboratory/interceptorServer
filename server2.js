@@ -2,11 +2,7 @@ import express from 'express';
 import { createClient } from '@supabase/supabase-js';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import { createProxyMiddleware } from 'http-proxy-middleware';
-import bodyParser from 'body-parser';
-import helmet from 'helmet';
-import morgan from 'morgan';
-import compression from 'compression';
+import axios from 'axios';
 import crypto from 'crypto';
 
 dotenv.config();
@@ -35,85 +31,11 @@ function sanitizeHeaders(headers) {
 async function storeLog(log) {
   try {
     await supabase.from('logs').insert(log);
+    console.log(`✅ Log stored for ${log.method} ${log.proxy_url} (${log.response_status})`);
   } catch (error) {
-    console.error('Failed to store log:', error);
+    console.error('❌ Failed to store log:', error);
   }
 }
-
-// Helper function to capture request body
-function captureRequestBody(req) {
-  return new Promise((resolve) => {
-    if (req.body) {
-      resolve(JSON.stringify(req.body));
-      return;
-    }
-
-    let body = '';
-    req.on('data', chunk => {
-      body += chunk.toString();
-    });
-    req.on('end', () => {
-      resolve(body);
-    });
-  });
-}
-
-// Helper function to capture response body
-function captureResponseBody(res) {
-  return new Promise((resolve) => {
-    const originalSend = res.send;
-    const originalJson = res.json;
-    const originalEnd = res.end;
-    const originalWrite = res.write;
-
-    let responseBody = '';
-    let responseSent = false;
-
-    res.send = function(data) {
-      if (!responseSent) {
-        responseBody = typeof data === 'string' ? data : JSON.stringify(data);
-        responseSent = true;
-      }
-      return originalSend.apply(res, arguments);
-    };
-
-    res.json = function(data) {
-      if (!responseSent) {
-        responseBody = JSON.stringify(data);
-        responseSent = true;
-      }
-      return originalJson.apply(res, arguments);
-    };
-
-    res.write = function(chunk, ...args) {
-      if (!responseSent && chunk) {
-        responseBody += chunk.toString();
-      }
-      return originalWrite.apply(res, [chunk, ...args]);
-    };
-
-    res.end = function(chunk, ...args) {
-      if (!responseSent && chunk) {
-        responseBody += chunk.toString();
-        responseSent = true;
-      }
-      resolve(responseBody);
-      return originalEnd.apply(res, [chunk, ...args]);
-    };
-  });
-}
-
-// Security middleware
-app.use(helmet({
-  contentSecurityPolicy: false,
-  crossOriginEmbedderPolicy: false
-}));
-
-// Compression middleware
-app.use(compression());
-
-// Logging middleware
-app.use(morgan('combined'));
 
 // CORS Configuration
 const corsOptions = {
@@ -144,13 +66,11 @@ const corsOptions = {
 // Apply CORS middleware
 app.use(cors(corsOptions));
 
-// Body parsing middleware - handle all content types
-app.use(bodyParser.json({ limit: '50mb' }));
-app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
-app.use(bodyParser.raw({ type: 'application/octet-stream', limit: '50mb' }));
-app.use(bodyParser.text({ type: 'text/plain', limit: '50mb' }));
+// Parse JSON
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// API Routes - must come before proxy middleware
+// Status endpoint
 app.get('/status', (req, res) => {
   res.json({
     mode: 'api',
@@ -230,7 +150,7 @@ app.get('/api/interceptors/:id/logs', async (req, res) => {
   }
 });
 
-// Dynamic proxy middleware - handle all other requests
+// Proxy middleware - handle all other requests
 app.use(async (req, res, next) => {
   // Extract interceptor ID from path
   const pathParts = req.path.split('/').filter(Boolean);
@@ -239,7 +159,13 @@ app.use(async (req, res, next) => {
   }
   
   const interceptorId = pathParts[0];
-  console.log(`Proxy request: ${req.method} ${req.path} -> interceptor: ${interceptorId}`);
+  console.log(`🔄 Proxy request: ${req.method} ${req.path} -> interceptor: ${interceptorId}`);
+  
+  // Capture request details for logging
+  const startTime = Date.now();
+  const requestHeaders = JSON.stringify(sanitizeHeaders(req.headers));
+  const requestBody = req.body ? JSON.stringify(req.body) : '';
+  let targetUrl = 'unknown'; // Initialize targetUrl
   
   try {
     // Get interceptor from database
@@ -251,113 +177,105 @@ app.use(async (req, res, next) => {
       .single();
     
     if (error || !interceptor) {
-      console.log(`Interceptor not found: ${interceptorId}`);
+      console.log(`❌ Interceptor not found: ${interceptorId}`);
       return res.status(404).json({ error: 'Interceptor not found' });
     }
     
     // Build target path
     const targetPath = req.path.replace(`/${interceptorId}`, '') || '/';
-    const targetUrl = interceptor.base_url.replace(/\/$/, '') + targetPath;
-    console.log(`Proxying to: ${targetUrl}`);
+    targetUrl = interceptor.base_url.replace(/\/$/, '') + targetPath;
+    console.log(`📡 Proxying to: ${targetUrl}`);
     
-    // Capture request details for logging
-    const startTime = Date.now();
-    const requestHeaders = JSON.stringify(sanitizeHeaders(req.headers));
+    // Prepare headers for proxy request
+    const proxyHeaders = { ...req.headers };
+    delete proxyHeaders.host;
+    delete proxyHeaders['x-forwarded-for'];
+    delete proxyHeaders['x-forwarded-proto'];
+    delete proxyHeaders['x-forwarded-host'];
     
-    // Capture request body
-    const requestBody = await captureRequestBody(req);
-    
-    // Create proxy middleware for this specific request
-    const proxyMiddleware = createProxyMiddleware({
-      target: interceptor.base_url,
-      changeOrigin: true,
-      ws: false, // Disable WebSocket proxying
-      secure: true,
+    // Make the proxy request using axios
+    const axiosConfig = {
+      method: req.method,
+      url: targetUrl,
+      headers: proxyHeaders,
       timeout: 30000,
-      proxyTimeout: 30000,
-      onProxyReq: (proxyReq, req, res) => {
-        // Remove problematic headers
-        proxyReq.removeHeader('host');
-        proxyReq.removeHeader('x-forwarded-for');
-        proxyReq.removeHeader('x-forwarded-proto');
-        proxyReq.removeHeader('x-forwarded-host');
-        
-        // Set target host
-        const targetHost = new URL(interceptor.base_url).host;
-        proxyReq.setHeader('host', targetHost);
-        
-        // Log proxy request
-        console.log(`Proxying ${req.method} to ${targetUrl}`);
-      },
-      onProxyRes: async (proxyRes, req, res) => {
-        // Capture response details
-        const duration = Date.now() - startTime;
-        const responseStatus = proxyRes.statusCode;
-        const responseHeaders = JSON.stringify(sanitizeHeaders(proxyRes.headers));
-        
-        // Capture response body
-        const responseBody = await captureResponseBody(res);
-        
-        // Store log
-        const log = {
-          id: crypto.randomUUID(),
-          interceptor_id: interceptor.id,
-          original_url: targetUrl,
-          proxy_url: req.originalUrl,
-          method: req.method,
-          headers: requestHeaders,
-          body: requestBody,
-          response_status: responseStatus,
-          response_headers: responseHeaders,
-          response_body: responseBody,
-          timestamp: new Date().toISOString(),
-          duration: duration
-        };
-        
-        await storeLog(log);
-        console.log(`Log stored for ${req.method} ${req.path} (${responseStatus})`);
-      },
-      onError: async (err, req, res) => {
-        console.error('Proxy error:', err);
-        
-        // Log the error
-        const duration = Date.now() - startTime;
-        const log = {
-          id: crypto.randomUUID(),
-          interceptor_id: interceptor.id,
-          original_url: targetUrl,
-          proxy_url: req.originalUrl,
-          method: req.method,
-          headers: requestHeaders,
-          body: requestBody,
-          response_status: 500,
-          response_headers: '{}',
-          response_body: JSON.stringify({ error: 'Proxy error', message: err.message }),
-          timestamp: new Date().toISOString(),
-          duration: duration
-        };
-        
-        await storeLog(log);
-        console.log(`Log stored for ${req.method} ${req.path} (500 - Proxy Error)`);
-        
-        if (!res.headersSent) {
-          res.status(500).json({ error: 'Proxy error', message: err.message });
-        }
+      validateStatus: () => true // Don't throw on any status code
+    };
+    
+    // Add body for methods that support it
+    if (['POST', 'PUT', 'PATCH'].includes(req.method) && req.body) {
+      axiosConfig.data = req.body;
+    }
+    
+    console.log(`🚀 Making ${req.method} request to ${targetUrl}`);
+    const proxyResponse = await axios(axiosConfig);
+    
+    // Capture response details
+    const duration = Date.now() - startTime;
+    const responseStatus = proxyResponse.status;
+    const responseHeaders = JSON.stringify(sanitizeHeaders(proxyResponse.headers));
+    const responseBody = typeof proxyResponse.data === 'string' ? proxyResponse.data : JSON.stringify(proxyResponse.data);
+    
+    // Store log
+    const log = {
+      id: crypto.randomUUID(),
+      interceptor_id: interceptor.id,
+      original_url: targetUrl,
+      proxy_url: req.originalUrl,
+      method: req.method,
+      headers: requestHeaders,
+      body: requestBody,
+      response_status: responseStatus,
+      response_headers: responseHeaders,
+      response_body: responseBody,
+      timestamp: new Date().toISOString(),
+      duration: duration
+    };
+    
+    await storeLog(log);
+    
+    // Forward the response
+    res.status(responseStatus);
+    
+    // Set response headers
+    Object.entries(proxyResponse.headers).forEach(([key, value]) => {
+      if (key.toLowerCase() !== 'content-length') {
+        res.set(key, value);
       }
     });
     
-    // Apply the proxy middleware
-    proxyMiddleware(req, res, next);
+    // Send response body
+    res.send(proxyResponse.data);
     
   } catch (error) {
-    console.error('Proxy setup error:', error);
-    res.status(500).json({ error: 'Proxy setup error', message: error.message });
+    console.error('❌ Proxy error:', error);
+    
+    // Log the error
+    const duration = Date.now() - startTime;
+    const log = {
+      id: crypto.randomUUID(),
+      interceptor_id: interceptorId,
+      original_url: targetUrl,
+      proxy_url: req.originalUrl,
+      method: req.method,
+      headers: requestHeaders,
+      body: requestBody,
+      response_status: 500,
+      response_headers: '{}',
+      response_body: JSON.stringify({ error: 'Proxy error', message: error.message }),
+      timestamp: new Date().toISOString(),
+      duration: duration
+    };
+    
+    await storeLog(log);
+    
+    res.status(500).json({ error: 'Proxy error', message: error.message });
   }
 });
 
 // Global error handler
 app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
+  console.error('❌ Unhandled error:', err);
   if (!res.headersSent) {
     res.status(500).json({ error: 'Internal server error', message: err.message });
   }
@@ -370,13 +288,10 @@ app.use('*', (req, res) => {
 
 // Start server
 app.listen(PORT, () => {
-  console.log(`🚀 Interceptor Proxy Server running on port ${PORT}`);
+  console.log(`🚀 Simple Interceptor Proxy Server running on port ${PORT}`);
   console.log(`📡 CORS enabled for localhost origins`);
   console.log(`🔄 Proxy functionality enabled`);
   console.log(`📝 Logging functionality enabled`);
-  console.log(`🔒 Security middleware enabled`);
-  console.log(`⚡ Compression enabled`);
-  console.log(`📊 Request logging enabled`);
   console.log(`🌐 Health check: http://localhost:${PORT}/health`);
   console.log(`📈 Status: http://localhost:${PORT}/status`);
-}); 
+});
