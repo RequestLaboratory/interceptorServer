@@ -27,6 +27,64 @@ function sanitizeHeaders(headers) {
   return sanitized;
 }
 
+// Helper function to verify session and extract user_id
+async function verifySession(sessionId) {
+  try {
+    const { data: session, error } = await supabase
+      .from('sessions')
+      .select('*')
+      .eq('id', sessionId)
+      .single();
+
+    if (error || !session) {
+      return { authenticated: false };
+    }
+
+    // Check if session is expired
+    if (new Date(session.expires_at) < new Date()) {
+      await supabase.from('sessions').delete().eq('id', sessionId);
+      return { authenticated: false };
+    }
+
+    // Extract user_id from session
+    // Check if user_id column exists, otherwise get from user_data
+    const userId = session.user_id || session.user_data?.id || null;
+    
+    if (!userId) {
+      return { authenticated: false };
+    }
+
+    return {
+      authenticated: true,
+      user_id: userId
+    };
+  } catch (error) {
+    console.error('Session verification error:', error);
+    return { authenticated: false };
+  }
+}
+
+// Helper function to extract user_id from request
+async function getUserIdFromRequest(req) {
+  const authHeader = req.headers.authorization;
+  
+  if (!authHeader) {
+    return null;
+  }
+
+  const sessionId = authHeader.replace('Bearer ', '');
+  if (!sessionId || sessionId === 'no-login') {
+    return null;
+  }
+
+  const session = await verifySession(sessionId);
+  if (!session.authenticated) {
+    return null;
+  }
+
+  return session.user_id;
+}
+
 // Helper function to store log
 async function storeLog(log) {
   try {
@@ -92,7 +150,19 @@ app.get('/health', (req, res) => {
 app.get('/api/interceptors', async (req, res) => {
   console.log('GET /api/interceptors called');
   try {
-    const { data, error } = await supabase.from('interceptors').select('*').order('created_at', { ascending: false });
+    const userId = await getUserIdFromRequest(req);
+    
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized', message: 'Valid session required' });
+    }
+
+    // Filter interceptors by user_id
+    const { data, error } = await supabase
+      .from('interceptors')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+    
     if (error) throw error;
     res.json(data);
   } catch (error) {
@@ -104,6 +174,12 @@ app.get('/api/interceptors', async (req, res) => {
 // Create interceptor
 app.post('/api/interceptors', async (req, res) => {
   try {
+    const userId = await getUserIdFromRequest(req);
+    
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized', message: 'Valid session required' });
+    }
+
     const uniqueCode = Math.random().toString(36).substring(2, 8);
     const interceptor = {
       id: uniqueCode,
@@ -111,7 +187,7 @@ app.post('/api/interceptors', async (req, res) => {
       base_url: req.body.base_url || req.body.baseUrl,
       created_at: new Date().toISOString(),
       is_active: true,
-      user_id: 'system'
+      user_id: userId
     };
     const { data, error } = await supabase.from('interceptors').insert(interceptor).select().single();
     if (error) throw error;
@@ -125,8 +201,33 @@ app.post('/api/interceptors', async (req, res) => {
 // Delete interceptor
 app.delete('/api/interceptors/:id', async (req, res) => {
   try {
+    const userId = await getUserIdFromRequest(req);
+    
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized', message: 'Valid session required' });
+    }
+
     const { id } = req.params;
-    const { error } = await supabase.from('interceptors').delete().eq('id', id);
+    
+    // First check if interceptor exists and belongs to user
+    const { data: interceptor, error: fetchError } = await supabase
+      .from('interceptors')
+      .select('*')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+    
+    if (fetchError || !interceptor) {
+      return res.status(404).json({ error: 'Interceptor not found', message: 'Interceptor does not exist or you do not have permission to delete it' });
+    }
+
+    // Delete the interceptor
+    const { error } = await supabase
+      .from('interceptors')
+      .delete()
+      .eq('id', id)
+      .eq('user_id', userId);
+    
     if (error) throw error;
     res.status(204).end();
   } catch (error) {
@@ -138,10 +239,37 @@ app.delete('/api/interceptors/:id', async (req, res) => {
 // Get logs
 app.get('/api/interceptors/:id/logs', async (req, res) => {
   try {
+    const userId = await getUserIdFromRequest(req);
+    
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized', message: 'Valid session required' });
+    }
+
     const { id } = req.params;
+    
+    // First verify that the interceptor belongs to the user
+    const { data: interceptor, error: interceptorError } = await supabase
+      .from('interceptors')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+    
+    if (interceptorError || !interceptor) {
+      return res.status(404).json({ error: 'Interceptor not found', message: 'Interceptor does not exist or you do not have permission to view its logs' });
+    }
+
     const limit = parseInt(req.query.limit) || 100;
     const offset = parseInt(req.query.offset) || 0;
-    const { data, error } = await supabase.from('logs').select('*').eq('interceptor_id', id).order('timestamp', { ascending: false }).range(offset, offset + limit - 1);
+    
+    // Get logs for this interceptor (ownership already verified above)
+    const { data, error } = await supabase
+      .from('logs')
+      .select('*')
+      .eq('interceptor_id', id)
+      .order('timestamp', { ascending: false })
+      .range(offset, offset + limit - 1);
+    
     if (error) throw error;
     res.json(data);
   } catch (error) {
