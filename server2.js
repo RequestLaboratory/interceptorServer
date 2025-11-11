@@ -172,12 +172,32 @@ app.get('/api/interceptors', async (req, res) => {
 });
 
 // Create interceptor
+const MAX_INTERCEPTORS_PER_USER = 3;
+
 app.post('/api/interceptors', async (req, res) => {
   try {
     const userId = await getUserIdFromRequest(req);
     
     if (!userId) {
       return res.status(401).json({ error: 'Unauthorized', message: 'Valid session required' });
+    }
+
+    // Check current interceptor count for user
+    const { count, error: countError } = await supabase
+      .from('interceptors')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', userId);
+    
+    if (countError) {
+      throw countError;
+    }
+
+    // Check if user has reached the limit
+    if (count >= MAX_INTERCEPTORS_PER_USER) {
+      return res.status(400).json({ 
+        error: 'Limit exceeded', 
+        message: `Maximum ${MAX_INTERCEPTORS_PER_USER} interceptors per user reached. Please delete an existing interceptor to create a new one.` 
+      });
     }
 
     const uniqueCode = Math.random().toString(36).substring(2, 8);
