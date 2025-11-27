@@ -298,6 +298,38 @@ app.get('/api/interceptors/:id/logs', async (req, res) => {
   }
 });
 
+// Delete all logs for an interceptor
+app.delete('/api/interceptors/:id/logs', async (req, res) => {
+  try {
+    const userId = await getUserIdFromRequest(req);
+    
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized', message: 'Valid session required' });
+    }
+
+    const { id } = req.params;
+    
+    // First verify that the interceptor belongs to the user
+    const { data: interceptor, error: interceptorError } = await supabase
+      .from('interceptors')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+    
+    if (interceptorError || !interceptor) {
+      return res.status(404).json({ error: 'Interceptor not found', message: 'Interceptor does not exist or you do not have permission to delete its logs' });
+    }
+
+    const { error } = await supabase.from('logs').delete().eq('interceptor_id', id);
+    if (error) throw error;
+    res.status(204).end();
+  } catch (error) {
+    console.error('Database error:', error);
+    res.status(500).json({ error: 'Database error', message: error.message });
+  }
+});
+
 // Proxy middleware - handle all other requests
 app.use(async (req, res, next) => {
   // Extract interceptor ID from path
