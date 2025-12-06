@@ -146,6 +146,61 @@ app.get('/health', (req, res) => {
   });
 });
 
+// Snyk NPM Package Analyser proxy endpoint
+app.post('/api/snyk/analyze', async (req, res) => {
+  console.log('📦 POST /api/snyk/analyze called');
+  
+  try {
+    const { dependencies } = req.body;
+    
+    if (!dependencies || Object.keys(dependencies).length === 0) {
+      return res.status(400).json({ 
+        error: 'Bad Request', 
+        message: 'No dependencies provided' 
+      });
+    }
+
+    console.log(`Analyzing ${Object.keys(dependencies).length} dependencies...`);
+
+    // Proxy request to Snyk API
+    const response = await axios.post(
+      'https://snyk.io/advisor/upload/check-packages/npm',
+      { dependencies },
+      {
+        headers: {
+          'accept': 'application/json, text/plain, */*',
+          'content-type': 'application/json',
+          'origin': 'https://snyk.io',
+          'referer': 'https://snyk.io/advisor/check/npm',
+          'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36'
+        },
+        timeout: 30000
+      }
+    );
+
+    console.log('Snyk API response:', response.data);
+    res.json(response.data);
+
+  } catch (error) {
+    console.error('Snyk API error:', error.message);
+    
+    if (error.response) {
+      // Snyk API returned an error
+      res.status(error.response.status).json({
+        error: 'Snyk API Error',
+        message: error.response.data?.message || error.message,
+        status: error.response.status
+      });
+    } else {
+      // Network or other error
+      res.status(500).json({
+        error: 'Proxy Error',
+        message: error.message
+      });
+    }
+  }
+});
+
 // Get interceptors
 app.get('/api/interceptors', async (req, res) => {
   console.log('GET /api/interceptors called');
