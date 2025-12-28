@@ -88,13 +88,46 @@ async function getUserIdFromRequest(req) {
   return session.user_id;
 }
 
+// Maximum logs per interceptor
+const MAX_LOGS_PER_INTERCEPTOR = 250;
+
+// Helper function to get log count for an interceptor
+async function getLogCount(interceptorId) {
+  try {
+    const { count, error } = await supabase
+      .from('logs')
+      .select('*', { count: 'exact', head: true })
+      .eq('interceptor_id', interceptorId);
+    
+    if (error) throw error;
+    return count || 0;
+  } catch (error) {
+    console.error('❌ Failed to get log count:', error);
+    return 0;
+  }
+}
+
 // Helper function to store log
 async function storeLog(log) {
   try {
+    // Check if interceptor has reached the limit
+    const currentCount = await getLogCount(log.interceptor_id);
+    
+    if (currentCount >= MAX_LOGS_PER_INTERCEPTOR) {
+      console.warn(`⚠️ Interceptor ${log.interceptor_id} has reached the limit of ${MAX_LOGS_PER_INTERCEPTOR} logs. Skipping log storage.`);
+      return { 
+        success: false, 
+        error: 'LIMIT_REACHED',
+        message: `Interceptor has reached the maximum limit of ${MAX_LOGS_PER_INTERCEPTOR} logs. Please clear logs or create a new interceptor.`
+      };
+    }
+    
     await supabase.from('logs').insert(log);
     console.log(`✅ Log stored for ${log.method} ${log.proxy_url} (${log.response_status})`);
+    return { success: true };
   } catch (error) {
     console.error('❌ Failed to store log:', error);
+    return { success: false, error: error.message };
   }
 }
 
@@ -314,6 +347,37 @@ app.delete('/api/interceptors/:id', async (req, res) => {
   }
 });
 
+// Get log count for an interceptor
+app.get('/api/interceptors/:id/logs/count', async (req, res) => {
+  try {
+    const userId = await getUserIdFromRequest(req);
+    
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized', message: 'Valid session required' });
+    }
+
+    const { id } = req.params;
+    
+    // First verify that the interceptor belongs to the user
+    const { data: interceptor, error: interceptorError } = await supabase
+      .from('interceptors')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+    
+    if (interceptorError || !interceptor) {
+      return res.status(404).json({ error: 'Interceptor not found', message: 'Interceptor does not exist or you do not have permission to view its logs' });
+    }
+
+    const count = await getLogCount(id);
+    res.json({ count, max: MAX_LOGS_PER_INTERCEPTOR, limitReached: count >= MAX_LOGS_PER_INTERCEPTOR });
+  } catch (error) {
+    console.error('Database error:', error);
+    res.status(500).json({ error: 'Database error', message: error.message });
+  }
+});
+
 // Get logs
 app.get('/api/interceptors/:id/logs', async (req, res) => {
   try {
@@ -337,6 +401,10 @@ app.get('/api/interceptors/:id/logs', async (req, res) => {
       return res.status(404).json({ error: 'Interceptor not found', message: 'Interceptor does not exist or you do not have permission to view its logs' });
     }
 
+    // Get log count to include in response
+    const logCount = await getLogCount(id);
+    const limitReached = logCount >= MAX_LOGS_PER_INTERCEPTOR;
+
     const limit = parseInt(req.query.limit) || 100;
     const offset = parseInt(req.query.offset) || 0;
     
@@ -349,7 +417,12 @@ app.get('/api/interceptors/:id/logs', async (req, res) => {
       .range(offset, offset + limit - 1);
     
     if (error) throw error;
-    res.json(data);
+    res.json({
+      logs: data,
+      count: logCount,
+      max: MAX_LOGS_PER_INTERCEPTOR,
+      limitReached: limitReached
+    });
   } catch (error) {
     console.error('Database error:', error);
     res.status(500).json({ error: 'Database error', message: error.message });
@@ -473,17 +546,23 @@ app.use(async (req, res, next) => {
       duration: duration
     };
     
-    await storeLog(log);
+    const logResult = await storeLog(log);
     
     // Forward the response
     res.status(responseStatus);
     
-    // Set response headers
+    // Set response headers (must be before sending body)
     Object.entries(proxyResponse.headers).forEach(([key, value]) => {
       if (key.toLowerCase() !== 'content-length') {
         res.set(key, value);
       }
     });
+    
+    // If limit reached, add warning header to response (before sending body)
+    if (logResult && !logResult.success && logResult.error === 'LIMIT_REACHED') {
+      res.set('X-Interceptor-Limit-Reached', 'true');
+      res.set('X-Interceptor-Limit-Message', logResult.message);
+    }
     
     // Send response body
     res.send(proxyResponse.data);
@@ -508,7 +587,13 @@ app.use(async (req, res, next) => {
       duration: duration
     };
     
-    await storeLog(log);
+    const logResult = await storeLog(log);
+    
+    // If limit reached, add warning header to response
+    if (logResult && !logResult.success && logResult.error === 'LIMIT_REACHED') {
+      res.set('X-Interceptor-Limit-Reached', 'true');
+      res.set('X-Interceptor-Limit-Message', logResult.message);
+    }
     
     res.status(500).json({ error: 'Proxy error', message: error.message });
   }
