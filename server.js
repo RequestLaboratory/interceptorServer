@@ -4,10 +4,13 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import axios from 'axios';
 import crypto from 'crypto';
+import http from 'http';
+import { initializeWebhookModule } from './webhookModule.js';
 
 dotenv.config();
 
 const app = express();
+const httpServer = http.createServer(app);
 const PORT = process.env.PORT || 3004;
 
 // Supabase client
@@ -385,6 +388,9 @@ app.delete('/api/interceptors/:id/logs', async (req, res) => {
   }
 });
 
+// Initialize webhook module
+initializeWebhookModule(httpServer, app, getUserIdFromRequest);
+
 // Proxy middleware - handle all other requests
 app.use(async (req, res, next) => {
   // Extract interceptor ID from path
@@ -522,11 +528,12 @@ app.use('*', (req, res) => {
 });
 
 // Start server
-app.listen(PORT, () => {
+httpServer.listen(PORT, () => {
   console.log(`🚀 Simple Interceptor Proxy Server running on port ${PORT}`);
   console.log(`📡 CORS enabled for localhost origins`);
   console.log(`🔄 Proxy functionality enabled`);
   console.log(`📝 Logging functionality enabled`);
+  console.log(`🔗 Webhook functionality enabled`);
   console.log(`🌐 Health check: http://localhost:${PORT}/health`);
   console.log(`📈 Status: http://localhost:${PORT}/status`);
 });
