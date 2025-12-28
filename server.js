@@ -429,6 +429,42 @@ app.get('/api/interceptors/:id/logs', async (req, res) => {
   }
 });
 
+// Test API endpoint for Cloudflare Worker health checks
+app.get('/api/test', async (req, res) => {
+  try {
+    // Simple database read - get count of interceptors
+    const { count, error } = await supabase
+      .from('interceptors')
+      .select('*', { count: 'exact', head: true });
+    
+    if (error) {
+      console.error('Test API database error:', error);
+      return res.status(500).json({ 
+        success: false, 
+        error: 'Database read failed', 
+        message: error.message,
+        timestamp: new Date().toISOString()
+      });
+    }
+    
+    console.log(`✅ Test API called - Interceptors count: ${count}`);
+    res.json({ 
+      success: true, 
+      message: 'Database read successful',
+      data: { interceptorsCount: count },
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Test API error:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Internal server error', 
+      message: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
 // Delete all logs for an interceptor
 app.delete('/api/interceptors/:id/logs', async (req, res) => {
   try {

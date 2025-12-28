@@ -1,0 +1,17 @@
+{
+  "name": "interceptor-test-worker",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker to periodically call the interceptor server test API",
+  "main": "worker.js",
+  "scripts": {
+    "test": "echo 'Deploy this worker via Cloudflare Dashboard. See README.md for instructions.'"
+  },
+  "keywords": [
+    "cloudflare",
+    "worker",
+    "cron",
+    "interceptor"
+  ],
+  "author": "",
+  "license": "MIT"
+}
