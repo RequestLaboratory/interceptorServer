@@ -21,7 +21,7 @@ A proxy server that intercepts and logs HTTP requests through configurable inter
 2. Create a `.env` file with your Supabase credentials:
 
    ```
-   SUPABASE_URL=https://opgwkalkqxudvkqxvfsc.supabase.co
+   SUPABASE_URL=https://scaykggszuqlpryalqkn.supabase.co
    SUPABASE_ANON_KEY=your_supabase_anon_key_here
    PORT=3004
    ```
