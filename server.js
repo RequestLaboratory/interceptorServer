@@ -6,40 +6,18 @@ import axios from 'axios';
 import crypto from 'crypto';
 import http from 'http';
 import https from 'https';
-import { initializeWebhookModule } from './webhook.js';
+import { initializeWebhookModule } from './webhookModule.js';
 
 dotenv.config();
 
 const app = express();
-const server = http.createServer(app);
+const httpServer = http.createServer(app);
 const PORT = process.env.PORT || 3004;
 
 // Supabase client
-const supabaseUrl = process.env.SUPABASE_URL || 'https://scaykggszuqlpryalqkn.supabase.co';
-const supabaseKey = process.env.SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNjYXlrZ2dzenVxbHByeWFscWtuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM4NTA0ODksImV4cCI6MjA4OTQyNjQ4OX0.jLUI_QZuPFQsJKX8d66QP3GLlcdAIDZNkEflFXOVrtY';
+const supabaseUrl = process.env.SUPABASE_URL || 'https://opgwkalkqxudvkqxvfsc.supabase.co';
+const supabaseKey = process.env.SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9wZ3drYWxrcXh1ZHZrcXh2ZnNjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDk1ODI3MjYsImV4cCI6MjA2NTE1ODcyNn0.JQEhK0Iub0e9ZAhO6H0BgzQXWa4S4MUml0fXkwyYN3E';
 const supabase = createClient(supabaseUrl, supabaseKey);
-
-// ─── Mock cache ───────────────────────────────────────────────────────────────
-const mockCache = new Map();
-
-async function reloadMockCache() {
-  const { data, error } = await supabase
-    .from('mock_configs')
-    .select('*')
-    .eq('is_active', true);
-  if (error) {
-    console.error('[mock-cache] Failed to load mock configs:', error.message);
-    return;
-  }
-  mockCache.clear();
-  for (const config of (data || [])) {
-    mockCache.set(`${config.method}:${config.url}`, config);
-  }
-  console.log(`[mock-cache] Loaded ${mockCache.size} active mock configs`);
-}
-
-// Load mock cache on startup
-await reloadMockCache();
 
 // Helper function to sanitize headers
 function sanitizeHeaders(headers) {
@@ -111,13 +89,46 @@ async function getUserIdFromRequest(req) {
   return session.user_id;
 }
 
+// Maximum logs per interceptor
+const MAX_LOGS_PER_INTERCEPTOR = 250;
+
+// Helper function to get log count for an interceptor
+async function getLogCount(interceptorId) {
+  try {
+    const { count, error } = await supabase
+      .from('logs')
+      .select('*', { count: 'exact', head: true })
+      .eq('interceptor_id', interceptorId);
+    
+    if (error) throw error;
+    return count || 0;
+  } catch (error) {
+    console.error('❌ Failed to get log count:', error);
+    return 0;
+  }
+}
+
 // Helper function to store log
 async function storeLog(log) {
   try {
+    // Check if interceptor has reached the limit
+    const currentCount = await getLogCount(log.interceptor_id);
+    
+    if (currentCount >= MAX_LOGS_PER_INTERCEPTOR) {
+      console.warn(`⚠️ Interceptor ${log.interceptor_id} has reached the limit of ${MAX_LOGS_PER_INTERCEPTOR} logs. Skipping log storage.`);
+      return { 
+        success: false, 
+        error: 'LIMIT_REACHED',
+        message: `Interceptor has reached the maximum limit of ${MAX_LOGS_PER_INTERCEPTOR} logs. Please clear logs or create a new interceptor.`
+      };
+    }
+    
     await supabase.from('logs').insert(log);
     console.log(`✅ Log stored for ${log.method} ${log.proxy_url} (${log.response_status})`);
+    return { success: true };
   } catch (error) {
     console.error('❌ Failed to store log:', error);
+    return { success: false, error: error.message };
   }
 }
 
@@ -125,31 +136,24 @@ async function storeLog(log) {
 const corsOptions = {
   origin: [
     'http://localhost:5173',
-    'http://localhost:5174',
-    'http://localhost:5175', // blogs dev server (alternate port)
+    'http://localhost:5174', 
     'http://localhost:3000',
     'http://localhost:4173',
-    'http://localhost:4174', // blogs preview server
     'https://www.requestlab.cc',
-    'https://requestlab.cc',
-    'https://requestlab.ashritv-portfolio.in',
-    'https://www.requestlab.ashritv-portfolio.in',
-    'https://www.blog.ashritv-portfolio.in',
-    'https://blog.ashritv-portfolio.in'
+    'https://requestlab.cc'
   ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH', 'HEAD'],
   allowedHeaders: [
-    'Content-Type',
-    'Authorization',
+    'Content-Type', 
+    'Authorization', 
     'ngrok-skip-browser-warning',
     'X-Requested-With',
     'Accept',
     'Accept-Language',
     'Cache-Control',
     'X-API-Key',
-    'X-Auth-Token',
-    'x-mock-source'
+    'X-Auth-Token'
   ],
   optionsSuccessStatus: 200
 };
@@ -177,6 +181,61 @@ app.get('/health', (req, res) => {
     status: 'healthy',
     timestamp: new Date().toISOString()
   });
+});
+
+// Snyk NPM Package Analyser proxy endpoint
+app.post('/api/snyk/analyze', async (req, res) => {
+  console.log('📦 POST /api/snyk/analyze called');
+  
+  try {
+    const { dependencies } = req.body;
+    
+    if (!dependencies || Object.keys(dependencies).length === 0) {
+      return res.status(400).json({ 
+        error: 'Bad Request', 
+        message: 'No dependencies provided' 
+      });
+    }
+
+    console.log(`Analyzing ${Object.keys(dependencies).length} dependencies...`);
+
+    // Proxy request to Snyk API
+    const response = await axios.post(
+      'https://snyk.io/advisor/upload/check-packages/npm',
+      { dependencies },
+      {
+        headers: {
+          'accept': 'application/json, text/plain, */*',
+          'content-type': 'application/json',
+          'origin': 'https://snyk.io',
+          'referer': 'https://snyk.io/advisor/check/npm',
+          'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36'
+        },
+        timeout: 30000
+      }
+    );
+
+    console.log('Snyk API response:', response.data);
+    res.json(response.data);
+
+  } catch (error) {
+    console.error('Snyk API error:', error.message);
+    
+    if (error.response) {
+      // Snyk API returned an error
+      res.status(error.response.status).json({
+        error: 'Snyk API Error',
+        message: error.response.data?.message || error.message,
+        status: error.response.status
+      });
+    } else {
+      // Network or other error
+      res.status(500).json({
+        error: 'Proxy Error',
+        message: error.message
+      });
+    }
+  }
 });
 
 // Get interceptors
@@ -251,54 +310,6 @@ app.post('/api/interceptors', async (req, res) => {
   }
 });
 
-// Update interceptor
-app.put('/api/interceptors/:id', async (req, res) => {
-  try {
-    const userId = await getUserIdFromRequest(req);
-
-    if (!userId) {
-      return res.status(401).json({ error: 'Unauthorized', message: 'Valid session required' });
-    }
-
-    const { id } = req.params;
-    const { base_url, name } = req.body;
-
-    if (!base_url && !name) {
-      return res.status(400).json({ error: 'Bad Request', message: 'At least one of base_url or name must be provided' });
-    }
-
-    const { data: interceptor, error: fetchError } = await supabase
-      .from('interceptors')
-      .select('*')
-      .eq('id', id)
-      .eq('user_id', userId)
-      .single();
-
-    if (fetchError || !interceptor) {
-      return res.status(404).json({ error: 'Interceptor not found', message: 'Interceptor does not exist or you do not have permission to update it' });
-    }
-
-    const updates = {};
-    if (base_url) updates.base_url = base_url;
-    if (name) updates.name = name;
-
-    const { data, error } = await supabase
-      .from('interceptors')
-      .update(updates)
-      .eq('id', id)
-      .eq('user_id', userId)
-      .select()
-      .single();
-
-    if (error) throw error;
-    await reloadMockCache();
-    res.json(data);
-  } catch (error) {
-    console.error('Database error:', error);
-    res.status(500).json({ error: 'Database error', message: error.message });
-  }
-});
-
 // Delete interceptor
 app.delete('/api/interceptors/:id', async (req, res) => {
   try {
@@ -337,6 +348,37 @@ app.delete('/api/interceptors/:id', async (req, res) => {
   }
 });
 
+// Get log count for an interceptor
+app.get('/api/interceptors/:id/logs/count', async (req, res) => {
+  try {
+    const userId = await getUserIdFromRequest(req);
+    
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized', message: 'Valid session required' });
+    }
+
+    const { id } = req.params;
+    
+    // First verify that the interceptor belongs to the user
+    const { data: interceptor, error: interceptorError } = await supabase
+      .from('interceptors')
+      .select('id')
+      .eq('id', id)
+      .eq('user_id', userId)
+      .single();
+    
+    if (interceptorError || !interceptor) {
+      return res.status(404).json({ error: 'Interceptor not found', message: 'Interceptor does not exist or you do not have permission to view its logs' });
+    }
+
+    const count = await getLogCount(id);
+    res.json({ count, max: MAX_LOGS_PER_INTERCEPTOR, limitReached: count >= MAX_LOGS_PER_INTERCEPTOR });
+  } catch (error) {
+    console.error('Database error:', error);
+    res.status(500).json({ error: 'Database error', message: error.message });
+  }
+});
+
 // Get logs
 app.get('/api/interceptors/:id/logs', async (req, res) => {
   try {
@@ -360,6 +402,10 @@ app.get('/api/interceptors/:id/logs', async (req, res) => {
       return res.status(404).json({ error: 'Interceptor not found', message: 'Interceptor does not exist or you do not have permission to view its logs' });
     }
 
+    // Get log count to include in response
+    const logCount = await getLogCount(id);
+    const limitReached = logCount >= MAX_LOGS_PER_INTERCEPTOR;
+
     const limit = parseInt(req.query.limit) || 100;
     const offset = parseInt(req.query.offset) || 0;
     
@@ -372,10 +418,51 @@ app.get('/api/interceptors/:id/logs', async (req, res) => {
       .range(offset, offset + limit - 1);
     
     if (error) throw error;
-    res.json(data);
+    res.json({
+      logs: data,
+      count: logCount,
+      max: MAX_LOGS_PER_INTERCEPTOR,
+      limitReached: limitReached
+    });
   } catch (error) {
     console.error('Database error:', error);
     res.status(500).json({ error: 'Database error', message: error.message });
+  }
+});
+
+// Test API endpoint for Cloudflare Worker health checks
+app.get('/api/test', async (req, res) => {
+  try {
+    // Simple database read - get count of interceptors
+    const { count, error } = await supabase
+      .from('interceptors')
+      .select('*', { count: 'exact', head: true });
+    
+    if (error) {
+      console.error('Test API database error:', error);
+      return res.status(500).json({ 
+        success: false, 
+        error: 'Database read failed', 
+        message: error.message,
+        timestamp: new Date().toISOString()
+      });
+    }
+    
+    console.log(`✅ Test API called - Interceptors count: ${count}`);
+    res.json({ 
+      success: true, 
+      message: 'Database read successful',
+      data: { interceptorsCount: count },
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Test API error:', error);
+    res.status(500).json({ 
+      success: false, 
+      error: 'Internal server error', 
+      message: error.message,
+      timestamp: new Date().toISOString()
+    });
   }
 });
 
@@ -411,437 +498,14 @@ app.delete('/api/interceptors/:id/logs', async (req, res) => {
   }
 });
 
-// ─── Mock configs CRUD ───────────────────────────────────────────────────────
-// GET /api/mock-configs
-  app.get('/api/mock-configs', async (req, res) => {
-    try {
-      const userId = await getUserIdFromRequest(req);
-      if (!userId) {
-        return res.status(401).json({ error: 'Unauthorized', message: 'Valid session required' });
-      }
-      const { data, error } = await supabase
-        .from('mock_configs')
-        .select('*')
-        .eq('user_id', userId)
-        .order('created_at', { ascending: false });
-      if (error) throw error;
-      res.json(data);
-    } catch (error) {
-      console.error('Database error:', error);
-      res.status(500).json({ error: 'Database error', message: error.message });
-    }
-  });
-
-  // POST /api/mock-configs
-  app.post('/api/mock-configs', async (req, res) => {
-    try {
-      const userId = await getUserIdFromRequest(req);
-      if (!userId) {
-        return res.status(401).json({ error: 'Unauthorized', message: 'Valid session required' });
-      }
-      const { method, url, status_code, response_body } = req.body;
-      if (!method || !url) {
-        return res.status(400).json({ error: 'Bad Request', message: 'method and url are required' });
-      }
-      if (typeof status_code !== 'number' || status_code < 100 || status_code > 599) {
-        return res.status(400).json({ error: 'Bad Request', message: 'status_code must be a number between 100 and 599' });
-      }
-      try {
-        JSON.stringify(response_body);
-      } catch (e) {
-        return res.status(400).json({ error: 'Bad Request', message: 'response_body must be valid JSON' });
-      }
-      const { data, error } = await supabase
-        .from('mock_configs')
-        .insert({ user_id: userId, method, url, status_code, response_body, is_active: true })
-        .select()
-        .single();
-      if (error) {
-        if (error.code === '23505') {
-          return res.status(409).json({ error: 'Conflict', message: 'A mock config for this method and URL already exists' });
-        }
-        throw error;
-      }
-      await reloadMockCache();
-      res.status(201).json(data);
-    } catch (error) {
-      console.error('Database error:', error);
-      res.status(500).json({ error: 'Database error', message: error.message });
-    }
-  });
-
-  // PUT /api/mock-configs/:id
-  app.put('/api/mock-configs/:id', async (req, res) => {
-    try {
-      const userId = await getUserIdFromRequest(req);
-      if (!userId) {
-        return res.status(401).json({ error: 'Unauthorized', message: 'Valid session required' });
-      }
-      const { id } = req.params;
-      const { data: existing, error: fetchError } = await supabase
-        .from('mock_configs')
-        .select('*')
-        .eq('id', id)
-        .eq('user_id', userId)
-        .single();
-      if (fetchError || !existing) {
-        return res.status(404).json({ error: 'Not found', message: 'Mock config not found or you do not have permission' });
-      }
-      const updates = { ...req.body, updated_at: new Date().toISOString() };
-      const { data, error } = await supabase
-        .from('mock_configs')
-        .update(updates)
-        .eq('id', id)
-        .eq('user_id', userId)
-        .select()
-        .single();
-      if (error) throw error;
-      await reloadMockCache();
-      res.json(data);
-    } catch (error) {
-      console.error('Database error:', error);
-      res.status(500).json({ error: 'Database error', message: error.message });
-    }
-  });
-
-  // DELETE /api/mock-configs/:id
-  app.delete('/api/mock-configs/:id', async (req, res) => {
-    try {
-      const userId = await getUserIdFromRequest(req);
-      if (!userId) {
-        return res.status(401).json({ error: 'Unauthorized', message: 'Valid session required' });
-      }
-      const { id } = req.params;
-      const { data: existing, error: fetchError } = await supabase
-        .from('mock_configs')
-        .select('*')
-        .eq('id', id)
-        .eq('user_id', userId)
-        .single();
-      if (fetchError || !existing) {
-        return res.status(404).json({ error: 'Not found', message: 'Mock config not found or you do not have permission' });
-      }
-      const { error } = await supabase
-        .from('mock_configs')
-        .delete()
-        .eq('id', id)
-        .eq('user_id', userId);
-      if (error) throw error;
-      await reloadMockCache();
-      res.status(204).end();
-    } catch (error) {
-      console.error('Database error:', error);
-      res.status(500).json({ error: 'Database error', message: error.message });
-    }
-  });
-
-// ─── Webhook module initialization ──────────────────────────────────────────
-initializeWebhookModule(server, app, getUserIdFromRequest);
-
-// ─── Blog Reactions & Comments API ───────────────────────────────────────────
-// These must be registered BEFORE the catch-all proxy middleware below.
-
-// GET /api/blog/reactions — returns likes/shares for all posts
-app.get('/api/blog/reactions', cors({ origin: true }), async (req, res) => {
-  const { data, error } = await supabase
-    .from('blog_reactions')
-    .select('slug, likes, shares');
-  if (error) return res.status(500).json({ error: error.message });
-  const result = {};
-  for (const row of data ?? []) result[row.slug] = { likes: row.likes, shares: row.shares };
-  res.json(result);
-});
-
-// POST /api/blog/:slug/like — atomic increment via postgres function
-app.post('/api/blog/:slug/like', cors({ origin: true }), async (req, res) => {
-  const { slug } = req.params;
-  if (!slug || slug.length > 100) return res.status(400).json({ error: 'Invalid slug' });
-  const { data, error } = await supabase.rpc('increment_blog_likes', { post_slug: slug });
-  if (error) return res.status(500).json({ error: error.message });
-  const row = data?.[0] ?? { slug, likes: 0, shares: 0 };
-  console.log(`❤️  Blog like: ${slug} → ${row.likes} likes`);
-  res.json(row);
-});
-
-// POST /api/blog/:slug/share — atomic increment via postgres function
-app.post('/api/blog/:slug/share', cors({ origin: true }), async (req, res) => {
-  const { slug } = req.params;
-  if (!slug || slug.length > 100) return res.status(400).json({ error: 'Invalid slug' });
-  const { data, error } = await supabase.rpc('increment_blog_shares', { post_slug: slug });
-  if (error) return res.status(500).json({ error: error.message });
-  const row = data?.[0] ?? { slug, likes: 0, shares: 0 };
-  console.log(`🔗 Blog share: ${slug} → ${row.shares} shares`);
-  res.json(row);
-});
-
-// GET /api/blog/:slug/comments — list comments newest-first
-app.get('/api/blog/:slug/comments', cors({ origin: true }), async (req, res) => {
-  const { slug } = req.params;
-  if (!slug || slug.length > 100) return res.status(400).json({ error: 'Invalid slug' });
-  const { data, error } = await supabase
-    .from('blog_comments')
-    .select('id, author_name, body, created_at')
-    .eq('slug', slug)
-    .order('created_at', { ascending: false });
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data ?? []);
-});
-
-// POST /api/blog/:slug/comments — add a comment
-app.post('/api/blog/:slug/comments', cors({ origin: true }), async (req, res) => {
-  const { slug } = req.params;
-  const { author_name, body } = req.body ?? {};
-  if (!slug || slug.length > 100) return res.status(400).json({ error: 'Invalid slug' });
-  if (!author_name || typeof author_name !== 'string' || !author_name.trim())
-    return res.status(400).json({ error: 'author_name is required' });
-  if (!body || typeof body !== 'string' || !body.trim())
-    return res.status(400).json({ error: 'body is required' });
-  if (author_name.length > 80)  return res.status(400).json({ error: 'author_name too long' });
-  if (body.length > 2000)       return res.status(400).json({ error: 'body too long (max 2000 chars)' });
-
-  const { data, error } = await supabase
-    .from('blog_comments')
-    .insert({ slug, author_name: author_name.trim(), body: body.trim() })
-    .select('id, author_name, body, created_at')
-    .single();
-  if (error) return res.status(500).json({ error: error.message });
-  console.log(`💬 Blog comment on ${slug} from "${author_name.trim()}"`);
-  res.status(201).json(data);
-});
-
-// POST /api/proxy-with-timing — no auth required (mirrors CORS proxy access model)
-// IMPORTANT: must be registered BEFORE the catch-all proxy middleware below
-app.post('/api/proxy-with-timing', async (req, res) => {
-  const { url, method, headers: reqHeaders = {}, body } = req.body || {};
-
-  if (!url || typeof url !== 'string') {
-    return res.status(400).json({ error: 'Missing required field: url' });
-  }
-  if (!method || typeof method !== 'string') {
-    return res.status(400).json({ error: 'Missing required field: method' });
-  }
-
-  let parsedUrl;
-  try {
-    parsedUrl = new URL(url);
-  } catch {
-    return res.status(400).json({ error: 'Invalid url' });
-  }
-
-  const isHttps = parsedUrl.protocol === 'https:';
-  const reqOptions = {
-    protocol: parsedUrl.protocol,
-    hostname: parsedUrl.hostname,
-    port: parsedUrl.port || (isHttps ? 443 : 80),
-    path: parsedUrl.pathname + parsedUrl.search,
-    method: method.toUpperCase(),
-    headers: { ...reqHeaders },
-  };
-
-  try {
-    const { statusCode, statusMessage, headers: resHeaders, bodyBuffer, timing } = await captureTimedRequest(
-      reqOptions,
-      body || null,
-    );
-
-    const bodyStr = bodyBuffer.toString('utf8');
-    return res.status(200).json({
-      status: statusCode,
-      statusText: statusMessage,
-      headers: resHeaders,
-      body: bodyStr,
-      timing,
-      error: null,
-    });
-  } catch (err) {
-    const timing = err.partialTiming || {
-      dns: null, tcp: null, tls: null, ttfb: null, download: null,
-      total: 0, connectionReused: false, failed: true, failedPhase: null,
-    };
-    return res.status(200).json({
-      status: null,
-      statusText: null,
-      headers: null,
-      body: null,
-      timing,
-      error: err.message || 'Request failed',
-    });
-  }
-});
-
-// Proxy middleware - handle all other requests
-app.use(async (req, res, next) => {
-  // Extract interceptor ID from path
-  const pathParts = req.path.split('/').filter(Boolean);
-  if (pathParts.length === 0) {
-    return res.status(404).json({ error: 'Not found' });
-  }
-  
-  const interceptorId = pathParts[0];
-  console.log(`🔄 Proxy request: ${req.method} ${req.path} -> interceptor: ${interceptorId}`);
-  
-  // Capture request details for logging
-  const startTime = Date.now();
-  const requestHeaders = JSON.stringify(sanitizeHeaders(req.headers));
-  const requestBody = req.body ? JSON.stringify(req.body) : '';
-  let targetUrl = 'unknown'; // Initialize targetUrl
-  
-  try {
-    // Get interceptor from database
-    const { data: interceptor, error } = await supabase
-      .from('interceptors')
-      .select('*')
-      .eq('id', interceptorId)
-      .eq('is_active', true)
-      .single();
-    
-    if (error || !interceptor) {
-      console.log(`❌ Interceptor not found: ${interceptorId}`);
-      return res.status(404).json({ error: 'Interceptor not found' });
-    }
-    
-    // Build target path (use req.url to preserve query string)
-    const targetPath = req.url.replace(`/${interceptorId}`, '') || '/';
-    targetUrl = interceptor.base_url.replace(/\/$/, '') + targetPath;
-    console.log(`📡 Proxying to: ${targetUrl}`);
-    
-    // Prepare headers for proxy request
-    const proxyHeaders = { ...req.headers };
-    delete proxyHeaders.host;
-    delete proxyHeaders['x-forwarded-for'];
-    delete proxyHeaders['x-forwarded-proto'];
-    delete proxyHeaders['x-forwarded-host'];
-    
-    // ─── Mock short-circuit ───────────────────────────────────────────────────
-    const mockKey = `${req.method}:${targetUrl}`;
-    const mockConfig = mockCache.get(mockKey);
-    if (mockConfig) {
-      console.log(`🎭 Serving mock response for ${mockKey}`);
-      const duration = Date.now() - startTime;
-      const mockLog = {
-        id: crypto.randomUUID(),
-        interceptor_id: interceptor.id,
-        original_url: targetUrl,
-        proxy_url: req.originalUrl,
-        method: req.method,
-        headers: requestHeaders,
-        body: requestBody,
-        response_status: mockConfig.status_code,
-        response_headers: '{}',
-        response_body: JSON.stringify(mockConfig.response_body),
-        timestamp: new Date().toISOString(),
-        duration: duration,
-        is_mock: true
-      };
-      await storeLog(mockLog);
-      res.set('x-mock-source', 'true');
-      return res.status(mockConfig.status_code).json(mockConfig.response_body);
-    }
-    // ─── End mock short-circuit ───────────────────────────────────────────────
-
-    // Make the proxy request using axios
-    const axiosConfig = {
-      method: req.method,
-      url: targetUrl,
-      headers: proxyHeaders,
-      timeout: 30000,
-      validateStatus: () => true // Don't throw on any status code
-    };
-    
-    // Add body for methods that support it
-    if (['POST', 'PUT', 'PATCH'].includes(req.method) && req.body) {
-      axiosConfig.data = req.body;
-    }
-    
-    console.log(`🚀 Making ${req.method} request to ${targetUrl}`);
-    const proxyResponse = await axios(axiosConfig);
-    
-    // Capture response details
-    const duration = Date.now() - startTime;
-    const responseStatus = proxyResponse.status;
-    const responseHeaders = JSON.stringify(sanitizeHeaders(proxyResponse.headers));
-    const responseBody = typeof proxyResponse.data === 'string' ? proxyResponse.data : JSON.stringify(proxyResponse.data);
-    
-    // Store log
-    const log = {
-      id: crypto.randomUUID(),
-      interceptor_id: interceptor.id,
-      original_url: targetUrl,
-      proxy_url: req.originalUrl,
-      method: req.method,
-      headers: requestHeaders,
-      body: requestBody,
-      response_status: responseStatus,
-      response_headers: responseHeaders,
-      response_body: responseBody,
-      timestamp: new Date().toISOString(),
-      duration: duration,
-      is_mock: false
-    };
-    
-    await storeLog(log);
-    
-    // Forward the response
-    res.status(responseStatus);
-    
-    // Set response headers
-    Object.entries(proxyResponse.headers).forEach(([key, value]) => {
-      if (key.toLowerCase() !== 'content-length') {
-        res.set(key, value);
-      }
-    });
-    
-    // Send response body
-    res.send(proxyResponse.data);
-    
-  } catch (error) {
-    console.error('❌ Proxy error:', error);
-    
-    // Log the error
-    const duration = Date.now() - startTime;
-    const log = {
-      id: crypto.randomUUID(),
-      interceptor_id: interceptorId,
-      original_url: targetUrl,
-      proxy_url: req.originalUrl,
-      method: req.method,
-      headers: requestHeaders,
-      body: requestBody,
-      response_status: 500,
-      response_headers: '{}',
-      response_body: JSON.stringify({ error: 'Proxy error', message: error.message }),
-      timestamp: new Date().toISOString(),
-      duration: duration
-    };
-    
-    await storeLog(log);
-    
-    res.status(500).json({ error: 'Proxy error', message: error.message });
-  }
-});
-
-// Global error handler
-app.use((err, req, res, next) => {
-  console.error('❌ Unhandled error:', err);
-  if (!res.headersSent) {
-    res.status(500).json({ error: 'Internal server error', message: err.message });
-  }
-});
-
-// 404 handler
-app.use('*', (req, res) => {
-  res.status(404).json({ error: 'Not found' });
-});
+// Initialize webhook module
+initializeWebhookModule(httpServer, app, getUserIdFromRequest);
 
 // ─── Timing Proxy ─────────────────────────────────────────────────────────────
 
 /**
  * Make an outbound HTTP/HTTPS request using Node.js socket events to capture
  * per-phase timing: DNS lookup, TCP connect, TLS handshake, TTFB, download.
- *
- * @param {object} reqOptions - Options for http/https.request()
- * @param {string|null} body - Request body string (or null)
- * @returns {Promise<{statusCode, statusMessage, headers, bodyBuffer, timing}>}
  */
 function captureTimedRequest(reqOptions, body) {
   const isHttps = reqOptions.protocol === 'https:' || reqOptions.port === 443;
@@ -849,7 +513,6 @@ function captureTimedRequest(reqOptions, body) {
 
   return new Promise((resolve, reject) => {
     const ts = { start: Date.now(), dns: null, tcp: null, tls: null, ttfbTs: null, endTs: null };
-    let connectTime = null;
     let isHttp2 = false;
 
     const req = transport.request(reqOptions, (res) => {
@@ -894,16 +557,14 @@ function captureTimedRequest(reqOptions, body) {
 
     req.on('socket', (socket) => {
       socket.on('lookup', () => { ts.dns = Date.now(); });
-      socket.on('connect', () => { ts.tcp = Date.now(); connectTime = ts.tcp; });
+      socket.on('connect', () => { ts.tcp = Date.now(); });
       socket.on('secureConnect', () => {
         ts.tls = Date.now();
-        connectTime = ts.tls;
         isHttp2 = socket.alpnProtocol === 'h2';
       });
     });
 
     req.on('error', (err) => {
-      // Partial timing on failure
       const dns = ts.dns !== null ? ts.dns - ts.start : null;
       const lookupEnd = ts.dns ?? ts.start;
       const tcp = ts.tcp !== null ? ts.tcp - lookupEnd : null;
@@ -936,20 +597,218 @@ function captureTimedRequest(reqOptions, body) {
 
     if (body) req.write(body);
     req.end();
-    void connectTime; // suppress unused warning
   });
 }
 
-// Start server (skip when imported by tests)
-if (process.env.NODE_ENV !== 'test') {
-  server.listen(PORT, () => {
-    console.log(`🚀 Simple Interceptor Proxy Server running on port ${PORT}`);
-    console.log(`📡 CORS enabled for localhost origins`);
-    console.log(`🔄 Proxy functionality enabled`);
-    console.log(`📝 Logging functionality enabled`);
-    console.log(`🌐 Health check: http://localhost:${PORT}/health`);
-    console.log(`📈 Status: http://localhost:${PORT}/status`);
-  });
-}
+// POST /api/proxy-with-timing — no auth required (mirrors CORS proxy access model)
+// IMPORTANT: must be registered BEFORE the catch-all proxy middleware below
+app.post('/api/proxy-with-timing', async (req, res) => {
+  const { url, method, headers: reqHeaders = {}, body } = req.body || {};
 
-export default app;
+  if (!url || typeof url !== 'string') {
+    return res.status(400).json({ error: 'Missing required field: url' });
+  }
+  if (!method || typeof method !== 'string') {
+    return res.status(400).json({ error: 'Missing required field: method' });
+  }
+
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(url);
+  } catch {
+    return res.status(400).json({ error: 'Invalid url' });
+  }
+
+  const isHttps = parsedUrl.protocol === 'https:';
+  const reqOptions = {
+    protocol: parsedUrl.protocol,
+    hostname: parsedUrl.hostname,
+    port: parsedUrl.port || (isHttps ? 443 : 80),
+    path: parsedUrl.pathname + parsedUrl.search,
+    method: method.toUpperCase(),
+    headers: { ...reqHeaders },
+  };
+
+  try {
+    const { statusCode, statusMessage, headers: resHeaders, bodyBuffer, timing } =
+      await captureTimedRequest(reqOptions, body || null);
+
+    return res.status(200).json({
+      status: statusCode,
+      statusText: statusMessage,
+      headers: resHeaders,
+      body: bodyBuffer.toString('utf8'),
+      timing,
+      error: null,
+    });
+  } catch (err) {
+    const timing = err.partialTiming || {
+      dns: null, tcp: null, tls: null, ttfb: null, download: null,
+      total: 0, connectionReused: false, failed: true, failedPhase: null,
+    };
+    return res.status(200).json({
+      status: null, statusText: null, headers: null, body: null,
+      timing,
+      error: err.message || 'Request failed',
+    });
+  }
+});
+
+// Proxy middleware - handle all other requests
+app.use(async (req, res, next) => {
+  // Extract interceptor ID from path
+  const pathParts = req.path.split('/').filter(Boolean);
+  if (pathParts.length === 0) {
+    return res.status(404).json({ error: 'Not found' });
+  }
+  
+  const interceptorId = pathParts[0];
+  console.log(`🔄 Proxy request: ${req.method} ${req.path} -> interceptor: ${interceptorId}`);
+  
+  // Capture request details for logging
+  const startTime = Date.now();
+  const requestHeaders = JSON.stringify(sanitizeHeaders(req.headers));
+  const requestBody = req.body ? JSON.stringify(req.body) : '';
+  let targetUrl = 'unknown'; // Initialize targetUrl
+  
+  try {
+    // Get interceptor from database
+    const { data: interceptor, error } = await supabase
+      .from('interceptors')
+      .select('*')
+      .eq('id', interceptorId)
+      .eq('is_active', true)
+      .single();
+    
+    if (error || !interceptor) {
+      console.log(`❌ Interceptor not found: ${interceptorId}`);
+      return res.status(404).json({ error: 'Interceptor not found' });
+    }
+    
+    // Build target path
+    const targetPath = req.path.replace(`/${interceptorId}`, '') || '/';
+    targetUrl = interceptor.base_url.replace(/\/$/, '') + targetPath;
+    console.log(`📡 Proxying to: ${targetUrl}`);
+    
+    // Prepare headers for proxy request
+    const proxyHeaders = { ...req.headers };
+    delete proxyHeaders.host;
+    delete proxyHeaders['x-forwarded-for'];
+    delete proxyHeaders['x-forwarded-proto'];
+    delete proxyHeaders['x-forwarded-host'];
+    
+    // Make the proxy request using axios
+    const axiosConfig = {
+      method: req.method,
+      url: targetUrl,
+      headers: proxyHeaders,
+      timeout: 30000,
+      validateStatus: () => true // Don't throw on any status code
+    };
+    
+    // Add body for methods that support it
+    if (['POST', 'PUT', 'PATCH'].includes(req.method) && req.body) {
+      axiosConfig.data = req.body;
+    }
+    
+    console.log(`🚀 Making ${req.method} request to ${targetUrl}`);
+    const proxyResponse = await axios(axiosConfig);
+    
+    // Capture response details
+    const duration = Date.now() - startTime;
+    const responseStatus = proxyResponse.status;
+    const responseHeaders = JSON.stringify(sanitizeHeaders(proxyResponse.headers));
+    const responseBody = typeof proxyResponse.data === 'string' ? proxyResponse.data : JSON.stringify(proxyResponse.data);
+    
+    // Store log
+    const log = {
+      id: crypto.randomUUID(),
+      interceptor_id: interceptor.id,
+      original_url: targetUrl,
+      proxy_url: req.originalUrl,
+      method: req.method,
+      headers: requestHeaders,
+      body: requestBody,
+      response_status: responseStatus,
+      response_headers: responseHeaders,
+      response_body: responseBody,
+      timestamp: new Date().toISOString(),
+      duration: duration
+    };
+    
+    const logResult = await storeLog(log);
+    
+    // Forward the response
+    res.status(responseStatus);
+    
+    // Set response headers (must be before sending body)
+    Object.entries(proxyResponse.headers).forEach(([key, value]) => {
+      if (key.toLowerCase() !== 'content-length') {
+        res.set(key, value);
+      }
+    });
+    
+    // If limit reached, add warning header to response (before sending body)
+    if (logResult && !logResult.success && logResult.error === 'LIMIT_REACHED') {
+      res.set('X-Interceptor-Limit-Reached', 'true');
+      res.set('X-Interceptor-Limit-Message', logResult.message);
+    }
+    
+    // Send response body
+    res.send(proxyResponse.data);
+    
+  } catch (error) {
+    console.error('❌ Proxy error:', error);
+    
+    // Log the error
+    const duration = Date.now() - startTime;
+    const log = {
+      id: crypto.randomUUID(),
+      interceptor_id: interceptorId,
+      original_url: targetUrl,
+      proxy_url: req.originalUrl,
+      method: req.method,
+      headers: requestHeaders,
+      body: requestBody,
+      response_status: 500,
+      response_headers: '{}',
+      response_body: JSON.stringify({ error: 'Proxy error', message: error.message }),
+      timestamp: new Date().toISOString(),
+      duration: duration
+    };
+    
+    const logResult = await storeLog(log);
+    
+    // If limit reached, add warning header to response
+    if (logResult && !logResult.success && logResult.error === 'LIMIT_REACHED') {
+      res.set('X-Interceptor-Limit-Reached', 'true');
+      res.set('X-Interceptor-Limit-Message', logResult.message);
+    }
+    
+    res.status(500).json({ error: 'Proxy error', message: error.message });
+  }
+});
+
+// Global error handler
+app.use((err, req, res, next) => {
+  console.error('❌ Unhandled error:', err);
+  if (!res.headersSent) {
+    res.status(500).json({ error: 'Internal server error', message: err.message });
+  }
+});
+
+// 404 handler
+app.use('*', (req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+// Start server
+httpServer.listen(PORT, () => {
+  console.log(`🚀 Simple Interceptor Proxy Server running on port ${PORT}`);
+  console.log(`📡 CORS enabled for localhost origins`);
+  console.log(`🔄 Proxy functionality enabled`);
+  console.log(`📝 Logging functionality enabled`);
+  console.log(`🔗 Webhook functionality enabled`);
+  console.log(`🌐 Health check: http://localhost:${PORT}/health`);
+  console.log(`📈 Status: http://localhost:${PORT}/status`);
+});
