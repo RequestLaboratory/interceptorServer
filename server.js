@@ -5,6 +5,7 @@ import dotenv from 'dotenv';
 import axios from 'axios';
 import crypto from 'crypto';
 import http from 'http';
+import https from 'https';
 import { initializeWebhookModule } from './webhook.js';
 
 dotenv.config();
@@ -608,6 +609,66 @@ app.post('/api/blog/:slug/comments', cors({ origin: true }), async (req, res) =>
   res.status(201).json(data);
 });
 
+// POST /api/proxy-with-timing — no auth required (mirrors CORS proxy access model)
+// IMPORTANT: must be registered BEFORE the catch-all proxy middleware below
+app.post('/api/proxy-with-timing', async (req, res) => {
+  const { url, method, headers: reqHeaders = {}, body } = req.body || {};
+
+  if (!url || typeof url !== 'string') {
+    return res.status(400).json({ error: 'Missing required field: url' });
+  }
+  if (!method || typeof method !== 'string') {
+    return res.status(400).json({ error: 'Missing required field: method' });
+  }
+
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(url);
+  } catch {
+    return res.status(400).json({ error: 'Invalid url' });
+  }
+
+  const isHttps = parsedUrl.protocol === 'https:';
+  const reqOptions = {
+    protocol: parsedUrl.protocol,
+    hostname: parsedUrl.hostname,
+    port: parsedUrl.port || (isHttps ? 443 : 80),
+    path: parsedUrl.pathname + parsedUrl.search,
+    method: method.toUpperCase(),
+    headers: { ...reqHeaders },
+  };
+
+  try {
+    const { statusCode, statusMessage, headers: resHeaders, bodyBuffer, timing } = await captureTimedRequest(
+      reqOptions,
+      body || null,
+    );
+
+    const bodyStr = bodyBuffer.toString('utf8');
+    return res.status(200).json({
+      status: statusCode,
+      statusText: statusMessage,
+      headers: resHeaders,
+      body: bodyStr,
+      timing,
+      error: null,
+    });
+  } catch (err) {
+    const timing = err.partialTiming || {
+      dns: null, tcp: null, tls: null, ttfb: null, download: null,
+      total: 0, connectionReused: false, failed: true, failedPhase: null,
+    };
+    return res.status(200).json({
+      status: null,
+      statusText: null,
+      headers: null,
+      body: null,
+      timing,
+      error: err.message || 'Request failed',
+    });
+  }
+});
+
 // Proxy middleware - handle all other requests
 app.use(async (req, res, next) => {
   // Extract interceptor ID from path
@@ -771,6 +832,113 @@ app.use((err, req, res, next) => {
 app.use('*', (req, res) => {
   res.status(404).json({ error: 'Not found' });
 });
+
+// ─── Timing Proxy ─────────────────────────────────────────────────────────────
+
+/**
+ * Make an outbound HTTP/HTTPS request using Node.js socket events to capture
+ * per-phase timing: DNS lookup, TCP connect, TLS handshake, TTFB, download.
+ *
+ * @param {object} reqOptions - Options for http/https.request()
+ * @param {string|null} body - Request body string (or null)
+ * @returns {Promise<{statusCode, statusMessage, headers, bodyBuffer, timing}>}
+ */
+function captureTimedRequest(reqOptions, body) {
+  const isHttps = reqOptions.protocol === 'https:' || reqOptions.port === 443;
+  const transport = isHttps ? https : http;
+
+  return new Promise((resolve, reject) => {
+    const ts = { start: Date.now(), dns: null, tcp: null, tls: null, ttfbTs: null, endTs: null };
+    let connectTime = null;
+    let isHttp2 = false;
+
+    const req = transport.request(reqOptions, (res) => {
+      ts.ttfbTs = Date.now();
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => {
+        ts.endTs = Date.now();
+        const bodyBuffer = Buffer.concat(chunks);
+
+        const dns = ts.dns !== null ? ts.dns - ts.start : null;
+        const lookupEnd = ts.dns ?? ts.start;
+        const tcp = ts.tcp !== null ? ts.tcp - lookupEnd : null;
+        const connectEnd = ts.tcp ?? lookupEnd;
+        const tls = (!isHttps || isHttp2) ? null : (ts.tls !== null ? ts.tls - connectEnd : null);
+        const afterConnect = ts.tls ?? ts.tcp ?? ts.dns ?? ts.start;
+        const ttfb = ts.ttfbTs - afterConnect;
+        const download = ts.endTs - ts.ttfbTs;
+        const phaseDurations = [dns, tcp, tls, ttfb, download].filter((v) => v !== null);
+        const total = phaseDurations.reduce((a, b) => a + b, 0);
+
+        resolve({
+          statusCode: res.statusCode,
+          statusMessage: res.statusMessage,
+          headers: res.headers,
+          bodyBuffer,
+          timing: {
+            dns: isHttp2 ? null : dns,
+            tcp: isHttp2 ? null : tcp,
+            tls: isHttp2 ? null : tls,
+            ttfb,
+            download,
+            total,
+            connectionReused: isHttp2,
+            failed: false,
+            failedPhase: null,
+          },
+        });
+      });
+      res.on('error', reject);
+    });
+
+    req.on('socket', (socket) => {
+      socket.on('lookup', () => { ts.dns = Date.now(); });
+      socket.on('connect', () => { ts.tcp = Date.now(); connectTime = ts.tcp; });
+      socket.on('secureConnect', () => {
+        ts.tls = Date.now();
+        connectTime = ts.tls;
+        isHttp2 = socket.alpnProtocol === 'h2';
+      });
+    });
+
+    req.on('error', (err) => {
+      // Partial timing on failure
+      const dns = ts.dns !== null ? ts.dns - ts.start : null;
+      const lookupEnd = ts.dns ?? ts.start;
+      const tcp = ts.tcp !== null ? ts.tcp - lookupEnd : null;
+      const connectEnd = ts.tcp ?? lookupEnd;
+      const tls = (!isHttps || isHttp2) ? null : (ts.tls !== null ? ts.tls - connectEnd : null);
+
+      let failedPhase = null;
+      if (ts.tls === null && isHttps && !isHttp2 && ts.tcp !== null) failedPhase = 'tls';
+      else if (ts.tcp === null && ts.dns !== null) failedPhase = 'tcp';
+      else if (ts.dns === null) failedPhase = 'dns';
+      else failedPhase = 'ttfb';
+
+      const phaseDurations = [dns, tcp, tls].filter((v) => v !== null);
+      const total = phaseDurations.reduce((a, b) => a + b, 0);
+
+      reject(Object.assign(err, {
+        partialTiming: {
+          dns: isHttp2 ? null : dns,
+          tcp: isHttp2 ? null : tcp,
+          tls: isHttp2 ? null : tls,
+          ttfb: null,
+          download: null,
+          total,
+          connectionReused: isHttp2,
+          failed: true,
+          failedPhase,
+        },
+      }));
+    });
+
+    if (body) req.write(body);
+    req.end();
+    void connectTime; // suppress unused warning
+  });
+}
 
 // Start server (skip when imported by tests)
 if (process.env.NODE_ENV !== 'test') {
