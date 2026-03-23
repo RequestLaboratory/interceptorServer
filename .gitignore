@@ -1,3 +1,12 @@
 .DS_Store
 node_modules
 .vercel
+
+# setup files like /tests, setup-db.js, Deploy.md
+tests/
+setup-db.js
+Deploy.md
+
+.env
+.env.*
+!.env.example

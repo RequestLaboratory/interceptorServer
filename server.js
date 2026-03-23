@@ -4,10 +4,13 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import axios from 'axios';
 import crypto from 'crypto';
+import http from 'http';
+import { initializeWebhookModule } from './webhook.js';
 
 dotenv.config();
 
 const app = express();
+const server = http.createServer(app);
 const PORT = process.env.PORT || 3004;
 
 // Supabase client
@@ -121,13 +124,17 @@ async function storeLog(log) {
 const corsOptions = {
   origin: [
     'http://localhost:5173',
-    'http://localhost:5174', 
+    'http://localhost:5174',
+    'http://localhost:5175', // blogs dev server (alternate port)
     'http://localhost:3000',
     'http://localhost:4173',
+    'http://localhost:4174', // blogs preview server
     'https://www.requestlab.cc',
     'https://requestlab.cc',
     'https://requestlab.ashritv-portfolio.in',
-    'https://www.requestlab.ashritv-portfolio.in'
+    'https://www.requestlab.ashritv-portfolio.in',
+    'https://www.blog.ashritv-portfolio.in',
+    'https://blog.ashritv-portfolio.in'
   ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH', 'HEAD'],
@@ -527,6 +534,80 @@ app.delete('/api/interceptors/:id/logs', async (req, res) => {
     }
   });
 
+// ─── Webhook module initialization ──────────────────────────────────────────
+initializeWebhookModule(server, app, getUserIdFromRequest);
+
+// ─── Blog Reactions & Comments API ───────────────────────────────────────────
+// These must be registered BEFORE the catch-all proxy middleware below.
+
+// GET /api/blog/reactions — returns likes/shares for all posts
+app.get('/api/blog/reactions', cors({ origin: true }), async (req, res) => {
+  const { data, error } = await supabase
+    .from('blog_reactions')
+    .select('slug, likes, shares');
+  if (error) return res.status(500).json({ error: error.message });
+  const result = {};
+  for (const row of data ?? []) result[row.slug] = { likes: row.likes, shares: row.shares };
+  res.json(result);
+});
+
+// POST /api/blog/:slug/like — atomic increment via postgres function
+app.post('/api/blog/:slug/like', cors({ origin: true }), async (req, res) => {
+  const { slug } = req.params;
+  if (!slug || slug.length > 100) return res.status(400).json({ error: 'Invalid slug' });
+  const { data, error } = await supabase.rpc('increment_blog_likes', { post_slug: slug });
+  if (error) return res.status(500).json({ error: error.message });
+  const row = data?.[0] ?? { slug, likes: 0, shares: 0 };
+  console.log(`❤️  Blog like: ${slug} → ${row.likes} likes`);
+  res.json(row);
+});
+
+// POST /api/blog/:slug/share — atomic increment via postgres function
+app.post('/api/blog/:slug/share', cors({ origin: true }), async (req, res) => {
+  const { slug } = req.params;
+  if (!slug || slug.length > 100) return res.status(400).json({ error: 'Invalid slug' });
+  const { data, error } = await supabase.rpc('increment_blog_shares', { post_slug: slug });
+  if (error) return res.status(500).json({ error: error.message });
+  const row = data?.[0] ?? { slug, likes: 0, shares: 0 };
+  console.log(`🔗 Blog share: ${slug} → ${row.shares} shares`);
+  res.json(row);
+});
+
+// GET /api/blog/:slug/comments — list comments newest-first
+app.get('/api/blog/:slug/comments', cors({ origin: true }), async (req, res) => {
+  const { slug } = req.params;
+  if (!slug || slug.length > 100) return res.status(400).json({ error: 'Invalid slug' });
+  const { data, error } = await supabase
+    .from('blog_comments')
+    .select('id, author_name, body, created_at')
+    .eq('slug', slug)
+    .order('created_at', { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data ?? []);
+});
+
+// POST /api/blog/:slug/comments — add a comment
+app.post('/api/blog/:slug/comments', cors({ origin: true }), async (req, res) => {
+  const { slug } = req.params;
+  const { author_name, body } = req.body ?? {};
+  if (!slug || slug.length > 100) return res.status(400).json({ error: 'Invalid slug' });
+  if (!author_name || typeof author_name !== 'string' || !author_name.trim())
+    return res.status(400).json({ error: 'author_name is required' });
+  if (!body || typeof body !== 'string' || !body.trim())
+    return res.status(400).json({ error: 'body is required' });
+  if (author_name.length > 80)  return res.status(400).json({ error: 'author_name too long' });
+  if (body.length > 2000)       return res.status(400).json({ error: 'body too long (max 2000 chars)' });
+
+  const { data, error } = await supabase
+    .from('blog_comments')
+    .insert({ slug, author_name: author_name.trim(), body: body.trim() })
+    .select('id, author_name, body, created_at')
+    .single();
+  if (error) return res.status(500).json({ error: error.message });
+  console.log(`💬 Blog comment on ${slug} from "${author_name.trim()}"`);
+  res.status(201).json(data);
+});
+
 // Proxy middleware - handle all other requests
 app.use(async (req, res, next) => {
   // Extract interceptor ID from path
@@ -693,7 +774,7 @@ app.use('*', (req, res) => {
 
 // Start server (skip when imported by tests)
 if (process.env.NODE_ENV !== 'test') {
-  app.listen(PORT, () => {
+  server.listen(PORT, () => {
     console.log(`🚀 Simple Interceptor Proxy Server running on port ${PORT}`);
     console.log(`📡 CORS enabled for localhost origins`);
     console.log(`🔄 Proxy functionality enabled`);
